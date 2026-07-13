@@ -8172,7 +8172,7 @@ def _models_cache_file_age_seconds(cache_path: Path, now: float) -> float | None
 
 
 def warm_models_catalog_provenance_if_cold() -> None:
-    """Best-effort, network-free publish of catalog provenance when memory is cold.
+    """Best-effort, NON-BLOCKING, disk-only publish of catalog provenance.
 
     The send path (``api/streaming.py``) resolves the wire model via
     ``resolve_model_provider`` without ever building the models catalog, and the
@@ -8182,28 +8182,50 @@ def warm_models_catalog_provenance_if_cold() -> None:
     invalidation, not a rare race. In that state the custom-proxy provenance
     signal (``_endpoint_advertised_model_ids``) is ``None`` and resolution falls
     to the cold-preserve default; this helper restores the endpoint-advertised
-    signal from the durable disk cache so the #433 bare-only-strip stays exact
-    and #5979 full-id preserve is backed by real provenance rather than the
-    fail-safe default.
+    signal from the durable disk cache so the #433 bare-only-strip stays exact.
 
-    Contract: ``prefer_cache=True`` resolves fresh-memory → valid-disk-cache
-    (which publishes provenance) → minimal static catalog (which deliberately
-    does NOT publish provenance, so a config-derived catalog can never
-    masquerade as endpoint evidence). It NEVER triggers a live provider rebuild,
-    so there is no network latency or flaky-network stall. Costs one global read
-    when already warm and a single ~sub-millisecond disk load once per cold
-    window. MUST be called from a request/worker context that does NOT hold
-    ``_cfg_lock`` (``get_available_models`` takes ``_available_models_cache_lock``
-    and may ``reload_config()`` → ``_cfg_lock``; calling it under ``_cfg_lock``
-    would invert the lock order). The send path satisfies this — it runs on the
-    detached worker thread with no config lock held.
+    Deliberately does NOT call ``get_available_models(prefer_cache=True)``: even
+    in prefer-cache mode that acquires ``_available_models_cache_lock`` and can
+    block up to ~60s waiting on an in-flight rebuild (unbounded in synchronous
+    rebuild mode) — unacceptable on the send hot path. Instead this:
+      * tries the cache lock NON-BLOCKING and returns immediately if it's busy
+        (a concurrent rebuild will publish provenance itself);
+      * reads ONLY the on-disk cache (no network, no live probe, no rebuild);
+      * publishes the snapshot + source fingerprint via the same globals the
+        real publish sites use, then ``_sync_models_cache_provenance()``.
+    Publishing the fingerprint from the CURRENT runtime is correct: the disk
+    cache is validated by schema/version/source-fingerprint on load
+    (``_is_loadable_disk_cache``), so a load success means it belongs to this
+    profile. Callers must not hold ``_cfg_lock`` (this reads config for the
+    fingerprint); the send worker satisfies that.
     """
+    global _available_models_cache, _available_models_cache_ts
+    global _available_models_cache_source_fingerprint
     if _models_cache_provenance is not None:
         return  # already warm — one global read, no work
+    got = _available_models_cache_lock.acquire(blocking=False)
+    if not got:
+        return  # a concurrent build/publish holds the lock; it will publish
     try:
-        get_available_models(prefer_cache=True)
+        if _models_cache_provenance is not None:
+            return  # published while we waited for the lock
+        try:
+            disk_groups = _load_models_cache_from_disk()
+        except Exception:
+            disk_groups = None
+        if disk_groups is None:
+            return  # no durable cache → stay cold, resolver preserves verbatim
+        _available_models_cache = disk_groups
+        _available_models_cache_ts = time.monotonic()
+        try:
+            _available_models_cache_source_fingerprint = _models_cache_source_fingerprint()
+        except Exception:
+            _available_models_cache_source_fingerprint = None
+        _sync_models_cache_provenance()
     except Exception:
         logger.debug("models catalog provenance warm failed", exc_info=True)
+    finally:
+        _available_models_cache_lock.release()
 
 
 def get_available_models_for_session_visit() -> dict:

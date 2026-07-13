@@ -597,23 +597,57 @@ def test_warm_models_catalog_provenance_noop_when_already_warm_5979():
 
 
 def test_warm_models_catalog_provenance_never_live_rebuilds_5979(monkeypatch):
-    """The warm helper must call get_available_models with prefer_cache=True so
-    it can never trigger a live provider probe on the send path.
+    """The warm helper must NEVER call get_available_models (which can acquire
+    the cache lock and block on / trigger a rebuild). It reads the disk cache
+    directly, so a live provider probe is structurally impossible on the send
+    path.
     """
     old_prov = config._models_cache_provenance
     config._models_cache_provenance = None
-    captured = {}
-    def _fake_get_available_models(*, prefer_cache=False, force_refresh=False):
-        captured['prefer_cache'] = prefer_cache
-        captured['force_refresh'] = force_refresh
-        return {'groups': []}
-    monkeypatch.setattr(config, 'get_available_models', _fake_get_available_models)
+    called = {'get_available_models': False}
+    def _boom(*a, **k):
+        called['get_available_models'] = True
+        raise AssertionError("warm must not call get_available_models")
+    monkeypatch.setattr(config, 'get_available_models', _boom)
     try:
-        config.warm_models_catalog_provenance_if_cold()
+        config.warm_models_catalog_provenance_if_cold()  # must not raise / call the above
     finally:
         config._models_cache_provenance = old_prov
-    assert captured.get('prefer_cache') is True, "warm must use prefer_cache=True (no live rebuild)"
-    assert captured.get('force_refresh') is False, "warm must never force_refresh"
+    assert called['get_available_models'] is False, (
+        "warm helper must read disk directly, never via get_available_models"
+    )
+
+
+def test_warm_models_catalog_provenance_nonblocking_when_lock_held_5979():
+    """The warm helper must NOT block on the models-cache lock. It tries the
+    lock non-blocking and returns immediately when a concurrent build/publish
+    holds it, so a send can never hang up to 60s behind a rebuild.
+    """
+    import threading
+    import time as _time
+    old_prov = config._models_cache_provenance
+    config._models_cache_provenance = None
+    got = config._available_models_cache_lock.acquire(blocking=False)
+    assert got, "precondition: could not take cache lock"
+    try:
+        result = {}
+        def _worker():
+            t0 = _time.time()
+            config.warm_models_catalog_provenance_if_cold()
+            result['elapsed'] = _time.time() - t0
+        th = threading.Thread(target=_worker)
+        th.start()
+        th.join(timeout=5)
+        blocked = th.is_alive()
+    finally:
+        config._available_models_cache_lock.release()
+        config._models_cache_provenance = old_prov
+    if blocked:
+        th.join(timeout=5)
+    assert not blocked, "warm helper blocked on a held cache lock (must be non-blocking)"
+    assert result.get('elapsed', 99) < 2.0, (
+        f"warm helper should return promptly when lock held, took {result.get('elapsed')!r}s"
+    )
 
 
 def test_custom_remote_preserves_unknown_prefix_548():

@@ -7893,14 +7893,23 @@ def _run_agent_streaming(
             _session_db = _build_session_db_for_stream(_state_db_path)
             # #5979: publish catalog provenance from the durable disk cache when
             # memory is cold, so the custom-proxy resolver below sees the
-            # endpoint-advertised model ids (network-free, never live-rebuilds,
-            # no _cfg_lock held on this worker thread). Without this the resolver
-            # falls to the cold-preserve default; with it, #433 bare-only-strip
-            # stays exact and #5979 full-id preserve is provenance-backed.
-            warm_models_catalog_provenance_if_cold()
-            resolved_model, resolved_provider, resolved_base_url = resolve_model_provider(
-                model_with_provider_context(model, provider_context)
-            )
+            # endpoint-advertised model ids (non-blocking, disk-only, never
+            # live-rebuilds). Both the warm and the resolve read profile-keyed
+            # config (cache path + source fingerprint via get_active_profile_name),
+            # but this streaming worker is a separate thread that does NOT inherit
+            # the HTTP handler's request-profile TLS — without binding it, a cold
+            # send from a NAMED profile would resolve against the DEFAULT profile's
+            # config and route to the wrong provider/base_url. Bind the captured
+            # owning-session profile across warm + resolve so both see the right
+            # profile (no-op for the default/root profile).
+            from api import profiles as profiles_api
+            with profiles_api.profile_scope_for_detached_worker(
+                _resolved_profile_name, "model resolution", logger_override=logger
+            ):
+                warm_models_catalog_provenance_if_cold()
+                resolved_model, resolved_provider, resolved_base_url = resolve_model_provider(
+                    model_with_provider_context(model, provider_context)
+                )
             configured_base_url = resolved_base_url
 
             # Resolve API key via Hermes runtime provider (matches gateway behaviour).
