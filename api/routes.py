@@ -9632,22 +9632,28 @@ def _sidebar_session_response_item(session: dict, *, redact_enabled: bool | None
     }
     if isinstance(item.get("title"), str):
         item["title"] = _redact_text(item["title"], _enabled=redact_enabled)
-    # display_title / _state_db_title can carry raw user-message-derived text
-    # (e.g. #6056 derives a delegated subagent's sidebar title from its first
-    # user message), so they must go through the SAME redaction as title — a
-    # credential-shaped value in a delegated goal would otherwise leak to the
-    # sidebar even with api_redact_enabled=True.
-    if isinstance(item.get("display_title"), str):
-        item["display_title"] = _redact_text(item["display_title"], _enabled=redact_enabled)
-    if isinstance(item.get("_state_db_title"), str):
-        item["_state_db_title"] = _redact_text(item["_state_db_title"], _enabled=redact_enabled)
-    # parent_title is a copied parent-session title that surfaces in the sidebar
-    # lineage collapse; redact it on the same path so a parent whose title was
-    # itself user-content-derived can't leak through the child row.
-    if isinstance(item.get("parent_title"), str):
-        item["parent_title"] = _redact_text(item["parent_title"], _enabled=redact_enabled)
+    _redact_sidebar_title_fields(item, redact_enabled)
     item["attention"] = _session_attention_summary(str(item.get("session_id") or ""))
     return item
+
+
+def _redact_sidebar_title_fields(item: dict, redact_enabled: bool | None = None) -> None:
+    """Redact every user-content-derived title field on a sidebar/search row in place.
+
+    `title` is redacted by the callers directly (they special-case it), but
+    `display_title`, `_state_db_title`, and `parent_title` can ALSO carry raw
+    user-message-derived text — e.g. #6056 derives a delegated subagent's
+    `display_title` from its first user message, and `parent_title` copies a
+    parent session's (possibly derived) title. Without this a credential-shaped
+    value in a delegated goal would surface in the sidebar / search results even
+    with `api_redact_enabled=True`. Shared by `_sidebar_session_response_item`
+    (`/api/sessions`) and every `/api/sessions/search` response branch so the two
+    endpoints can never drift on which fields get redacted.
+    """
+    for field in ("display_title", "_state_db_title", "parent_title"):
+        value = item.get(field)
+        if isinstance(value, str):
+            item[field] = _redact_text(value, _enabled=redact_enabled)
 
 
 # ── Login page locale strings ─────────────────────────────────────────────────
@@ -16581,12 +16587,21 @@ def _handle_sessions_search(handler, parsed):
         depth = max(0, int(qs.get("depth", ["5"])[0]))
     except (ValueError, TypeError):
         depth = 5
+    # Read the redaction setting ONCE for the whole response (mirrors the
+    # /api/sessions read-once optimization, #4662) and thread it through every
+    # branch + the shared title-field redactor so search rows redact the same
+    # fields as the sidebar list.
+    try:
+        _search_redact_enabled = bool(load_settings().get("api_redact_enabled", True))
+    except Exception:
+        _search_redact_enabled = True  # fail safe: redact when settings unreadable
     if not q:
         safe_sessions = []
         for s in sessions:
             item = dict(s)
             if isinstance(item.get("title"), str):
-                item["title"] = _redact_text(item["title"])
+                item["title"] = _redact_text(item["title"], _enabled=_search_redact_enabled)
+            _redact_sidebar_title_fields(item, _search_redact_enabled)
             safe_sessions.append(item)
         return j(handler, {
             "sessions": safe_sessions,
@@ -16599,7 +16614,8 @@ def _handle_sessions_search(handler, parsed):
         if title_match:
             item = dict(s, match_type="title")
             if isinstance(item.get("title"), str):
-                item["title"] = _redact_text(item["title"])
+                item["title"] = _redact_text(item["title"], _enabled=_search_redact_enabled)
+            _redact_sidebar_title_fields(item, _search_redact_enabled)
             results.append(item)
             continue
         if content_search:
@@ -16612,9 +16628,10 @@ def _handle_sessions_search(handler, parsed):
                         item = dict(s, match_type="content")
                         preview = _session_search_preview(c, q)
                         if preview:
-                            item["match_preview"] = _redact_text(preview)
+                            item["match_preview"] = _redact_text(preview, _enabled=_search_redact_enabled)
                         if isinstance(item.get("title"), str):
-                            item["title"] = _redact_text(item["title"])
+                            item["title"] = _redact_text(item["title"], _enabled=_search_redact_enabled)
+                        _redact_sidebar_title_fields(item, _search_redact_enabled)
                         results.append(item)
                         break
             except (KeyError, Exception):
